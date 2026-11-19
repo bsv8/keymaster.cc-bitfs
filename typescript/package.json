@@ -1,0 +1,50 @@
+{
+  "name": "keymaster-bitfs",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@bsv/sdk": "2.0.5",
+    "@chainsafe/libp2p-noise": "17.0.0",
+    "@chainsafe/libp2p-yamux": "8.0.1",
+    "@libp2p/crypto": "5.2.0",
+    "@libp2p/identify": "4.1.18",
+    "@libp2p/interface": "3.4.0",
+    "@libp2p/tcp": "11.0.32",
+    "@libp2p/websockets": "10.1.25",
+    "@multiformats/multiaddr": "13.0.3",
+    "bitcoin-libp2p": "0.3.2",
+    "bitfs-protocol": "0.6.0",
+    "bsv8-channel-protocol": "0.6.0",
+    "cborg": "5.1.6",
+    "keymaster-trade-scheduler": "0.3.0",
+    "keymaster-utxo-manager": "0.7.0",
+    "libp2p": "3.5.1",
+    "masterseed": "1.1.0",
+    "sat-subscription-protocol": "0.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "5.9.3"
+  },
+  "bin": {
+    "keymaster-bitfs": "dist/cli/main.js"
+  },
+  "overrides": {
+    "keymaster-multisig-pool@4.0.0": {
+      "@bsv/sdk": "2.1.7"
+    }
+  }
+}
