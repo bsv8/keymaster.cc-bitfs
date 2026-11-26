@@ -10,6 +10,7 @@ export interface SchedulerHostSettings {
   poolBlocks: number;
   /** 任务内总席位（基础席位 + 浮动位）。 */
   schedulerTotalSeats: number;
+  schedulerSeatsPerSeller?: number;
   /** 浮动位：在席且未测速的卖家上限。 */
   schedulerFloatingSeats: number;
   /** 请求停摆超时（毫秒）：连续这么久没有新字节即判停摆。 */
@@ -47,6 +48,7 @@ export function schedulerKernelConfig(settings: SchedulerHostSettings): Config {
       ? settings.maxFullBlockPriceSatoshis
       : SCHEDULER_HOST_DEFAULTS.maxFullBlockPriceSatoshis,
     baseSeats,
+    seatsPerSeller: settings.schedulerSeatsPerSeller ?? 1,
     floatingSeats,
     poolBlocks: positiveInteger(settings.poolBlocks, SCHEDULER_HOST_DEFAULTS.poolBlocks),
     requestTimeoutMs: positiveInteger(settings.schedulerRequestTimeoutMs, SCHEDULER_HOST_DEFAULTS.schedulerRequestTimeoutMs),

@@ -58,13 +58,13 @@ export class BitfsSellerRuntime {
     if (!isVerifiedHashRequest(request)) throw new TypeError("卖方只接受 VerifiedHashRequest");
     const nowMs = this.deps.nowMs();
     this.prune(nowMs);
+    if (request.expires_at_ms <= nowMs) return null;
+    signal?.throwIfAborted();
     const settings = this.deps.settings();
-    if (!settings.sellerEnabled || request.expires_at_ms <= nowMs) return null;
     const dedup = dedupKey(request);
     const key = `${dedup.from_public_key}\0${dedup.message_id}`;
     if (this.seen.has(key)) return null;
     this.seen.set(key, request.expires_at_ms);
-    signal?.throwIfAborted();
     const route = this.deps.selectTransport(request);
     if (!route) return null;
     const seed = await this.deps.findContent(request.body.hash, signal);

@@ -111,7 +111,6 @@ export interface ProtocolSpendService {
 }
 
 export interface BitfsSellerSettings {
-  sellerEnabled: boolean;
   seedPriceSatoshis: string;
   fullBlockPriceSatoshis: string;
   maxBlocksPerBatch: number;

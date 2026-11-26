@@ -1,7 +1,7 @@
 import { hexToBytes } from "bitcoin-libp2p/identity";
 import { parse, type Signer } from "bitfs-protocol";
 import { Digest, verifyBlock } from "masterseed";
-import type { Command, Payload, View } from "keymaster-trade-scheduler";
+import type { Command, Payload, State, View } from "keymaster-trade-scheduler";
 import { acceptBitfsBuyerQuote, type BitfsBuyerQuoteView } from "./buyerTask.js";
 import { createBitfsBuyerDownloadPlan } from "./buyerDownloadPlan.js";
 import { BitfsBuyerProtocol, readVerifiedSeed, type BitfsBuyerPurchaseProgress, type BitfsVerifiedDownload } from "./buyerProtocol.js";
@@ -77,7 +77,31 @@ function schedulerFailureSettled(view: View): boolean {
   return view.execution === "stopped" && !!view.failure && view.funds !== "pending";
 }
 
+/** 诊断专用归属摘要；不参与调度、付款或恢复判断。 */
+function schedulerOwnership(state: State) {
+  return {
+    revision: state.revision, intent: state.intent, failure: state.failure,
+    pools: Object.values(state.pools).map(pool => ({
+      id: pool.id, sellerId: pool.sellerId, seatIndex: (pool as typeof pool & { seatIndex?: number }).seatIndex ?? 0,
+      funding: pool.funding, scheduling: pool.scheduling, requestId: pool.requestId,
+      openCommandId: pool.openCommandId, closeCommandId: pool.closeCommandId,
+      openingObserved: pool.openingObserved,
+    })),
+    requests: Object.values(state.requests).map(request => ({
+      id: request.id, poolId: request.poolId, state: request.state,
+      commandId: request.commandId, contentIds: request.contentIds,
+    })),
+  };
+}
+
 const SEARCH_TIMEOUT_MS = 10 * 60_000;
+const PLAYBACK_BLOCK_BYTES = 256 * 1024;
+
+export interface BitfsPlaybackRange {
+  fileSizeBytes?: number;
+  mediaType?: string;
+  bytes?: Uint8Array;
+}
 
 function quoteArbiter(task: Download, quote: BitfsBuyerQuoteView, endpoints: BitfsArbiter[]) {
   return endpoints.find(endpoint => endpoint.publicKeyHex !== task.identity.owner
@@ -95,6 +119,7 @@ type Link = {
   quote?: BitfsBuyerQuoteView;
   protocols: Map<string, BitfsBuyerProtocol>;
   closed: boolean;
+  seatIndex?: number;
   bytesIn?: number;
   requestProgress?: { id: string; start: number; sent: number };
 };
@@ -110,16 +135,20 @@ type Download = {
   identity: BitfsBuyerIdentity;
   seed: string;
   settings: BitfsBuyerSettings;
+  manualPurchase?: boolean;
   controller: AbortController;
   release(): void;
   links: Map<string, Link>;
   expiresAtMs: number;
   requestId?: string;
+  supplementalDemands: Set<string>;
+  supplementalPublishing: number;
   tail: Promise<void>;
   timer?: ReturnType<typeof setTimeout>;
   wake?: ReturnType<typeof setTimeout>;
   purchase?: Purchase;
   progress?: BitfsBuyerPurchaseProgress;
+  playbackPriority?: string[];
   committed?: boolean;
   stopped?: boolean;
   closeTimer?: ReturnType<typeof setTimeout>;
@@ -182,9 +211,14 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
   }
 
   function quoteViews(task: Download): BitfsBuyerQuoteView[] {
-    return [...task.links.values()].filter(link => !link.closed && link.quote
-      && Number(link.quote.quoteExpiresAtUnixSeconds) * 1_000 > Date.now())
-      .map(link => link.quote!);
+    const quotes = new Map<string, BitfsBuyerQuoteView>();
+    for (const link of task.links.values()) {
+      const quote = link.quote;
+      if (!link.closed && quote && Number(quote.quoteExpiresAtUnixSeconds) * 1_000 > Date.now()) {
+        if (!quotes.has(quote.sellerPublicKeyHex)) quotes.set(quote.sellerPublicKeyHex, quote);
+      }
+    }
+    return [...quotes.values()];
   }
 
   const snapshot = (task: Download): BitfsBuyerSnapshot => ({
@@ -209,6 +243,12 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
 
   async function drop(task: Download, cause?: unknown): Promise<void> {
     if (task.stopped) return;
+    traceBitfs("buyer.drop.start", () => ({
+      seedHashHex: task.seed, runId: task.runId, taskId: task.purchase?.id,
+      committed: task.committed === true, aborted: task.controller.signal.aborted,
+      scheduler: task.purchase ? schedulerOwnership(task.purchase.adapter.snapshot()) : undefined,
+      error: cause,
+    }));
     task.stopped = true;
     task.controller.abort();
     if (task.timer) clearTimeout(task.timer);
@@ -219,14 +259,32 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
     if (cause) notifyFailure(task, cause);
     const closes = [...task.links.values()].map(link => link.offer.close());
     try {
-      const routing = task.requestId ? options.withdrawDemand?.(task.seed, task.requestId) : undefined;
-      await Promise.allSettled([adapterDrain, routing, ...closes]);
+      const demandIds = [...task.supplementalDemands];
+      if (task.requestId) demandIds.push(task.requestId);
+      const routing = demandIds.map(id => options.withdrawDemand?.(task.seed, id));
+      await Promise.allSettled([adapterDrain, ...routing, ...closes]);
+      const runtime = task.purchase;
+      if (runtime && !lifecycle.aborted) {
+        for (const pool of Object.values(runtime.adapter.snapshot().pools)) {
+          if (pool.openingObserved || !["opening", "problem"].includes(pool.funding)) continue;
+          try {
+            const sessionId = await readSchedulerPoolSessionId(journalSessions, runtime.id, pool);
+            await cancelPreparedOpening(task, sessionId, lifecycle);
+          } catch (error) {
+            traceBitfs("buyer.cancel-opening.failed", () => ({ poolId: pool.id, error }));
+          }
+        }
+      }
     } finally {
       if (downloads.get(task.seed) === task) downloads.delete(task.seed);
       task.completeStop();
       try { options.onStopped?.(task.seed, task.committed === true); } catch (error) { traceBitfs("buyer.observer.failed", () => ({ error })); }
       task.releaseSlot?.();
       task.release();
+      traceBitfs("buyer.drop.finish", () => ({
+        seedHashHex: task.seed, runId: task.runId, taskId: task.purchase?.id,
+        committed: task.committed === true,
+      }));
     }
   }
 
@@ -280,33 +338,62 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
     assertCurrent(task);
     const runtime = task.purchase;
     if (!runtime) return;
+    traceBitfs("buyer.event.start", () => ({
+      seedHashHex: task.seed, runId: task.runId, taskId: runtime.id,
+      eventId, payload, revision: runtime.adapter.snapshot().revision,
+      scheduler: schedulerOwnership(runtime.adapter.snapshot()),
+    }));
     const commands = await runtime.adapter.handle({ eventId, payload });
     await runCommands(task, commands);
     if (task.stopped) return;
     await updateView(task, runtime);
+    traceBitfs("buyer.event.finish", () => ({
+      seedHashHex: task.seed, runId: task.runId, taskId: runtime.id,
+      eventId, payloadType: payload.type, commandIds: commands.map(command => command.commandId),
+      revision: runtime.adapter.snapshot().revision,
+      scheduler: schedulerOwnership(runtime.adapter.snapshot()),
+    }));
   }
 
   async function runCommands(task: Download, commands: readonly Command[]): Promise<void> {
     const runtime = task.purchase!;
     for (const command of commands) {
       assertCurrent(task);
+      traceBitfs("buyer.scheduler.command.start", () => ({
+        seedHashHex: task.seed, runId: task.runId, taskId: runtime.id,
+        commandId: command.commandId, commandType: command.type, reason: command.reason,
+        poolId: "poolId" in command ? command.poolId : undefined,
+        requestId: "requestId" in command ? command.requestId : undefined,
+        scheduler: schedulerOwnership(runtime.adapter.snapshot()),
+      }));
       try {
         await runtime.executor.run(command);
+        traceBitfs("buyer.scheduler.command.finish", () => ({
+          seedHashHex: task.seed, runId: task.runId, taskId: runtime.id,
+          commandId: command.commandId, commandType: command.type,
+          scheduler: schedulerOwnership(runtime.adapter.snapshot()),
+        }));
       } catch (error) {
         assertCurrent(task);
-        traceBitfs("buyer.scheduler.command.failed", () => ({ commandId: command.commandId, type: command.type, error }));
+        traceBitfs("buyer.scheduler.command.failed", () => ({ commandId: command.commandId, type: command.type, error,
+          scheduler: schedulerOwnership(runtime.adapter.snapshot()) }));
         if (command.type === "open") {
-          const saved = await journalSessions.get(schedulerPoolSessionId(runtime.id, command.poolId));
-          const signed = saved?.evidence.some(name => name === "kind2-opening-request" || name === "funding-transaction");
           const code = (error as { code?: string })?.code;
           const insufficient = code === "insufficient" || code === "no-utxos" || code === "insufficient_funds";
-          if (!signed && !insufficient) {
-            await event(task, `open-offline-${command.commandId}`, { type: "seller", sellerId: command.sellerId, online: false });
+          if (!insufficient) {
+            const seat = runtime.adapter.snapshot().pools[command.poolId]?.seatIndex ?? 0;
+            const link = [...task.links.values()].find(item => !item.closed && item.seatIndex === seat
+              && item.quote?.sellerPublicKeyHex === command.sellerId);
+            if (link) {
+              link.closed = true;
+              void link.offer.close().catch(error => traceBitfs("buyer.seat.close.failed", () => ({ error })));
+            }
+            await reportSellerLinks(task, command.sellerId, `open-offline-${command.commandId}`);
+            await releaseUnfundedOpening(task, command.poolId, command.commandId);
+            continue;
           }
-          await event(task, `open-error-${command.commandId}`, signed
-            ? { type: "unknown", poolId: command.poolId, commandId: command.commandId }
-            : { type: "open-failed", poolId: command.poolId, commandId: command.commandId, released: true,
-                insufficientFunds: insufficient });
+          await event(task, `open-error-${command.commandId}`,
+            { type: "open-failed", poolId: command.poolId, commandId: command.commandId, released: true, insufficientFunds: true });
         } else if (command.type === "download") {
           const id = schedulerPoolSessionId(runtime.id, command.poolId);
           const record = await journalSessions.get(id);
@@ -333,7 +420,7 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
     }
     if (schedulerSuccessSettled(view) || schedulerFailureSettled(view)) {
       if (schedulerSuccessSettled(view)) await commit(task);
-      if (view.failure) notifyFailure(task, new Error(`BitFS download failed: ${view.failure.code}`));
+      if (view.failure) notifyFailure(task, Object.assign(new Error(`BitFS download failed: ${view.failure.code}`), { code: view.failure.code }));
       await finish(task, task.committed ? "completed" : view.failure ? "failed" : "cancelled");
       return;
     }
@@ -435,6 +522,90 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
     return protocol;
   }
 
+  function assignSeat(task: Download, link: Link): void {
+    if (!link.quote || link.seatIndex !== undefined) return;
+    const seller = link.quote.sellerPublicKeyHex;
+    const occupied = new Set([...task.links.values()].filter(item => !item.closed
+      && item.quote?.sellerPublicKeyHex === seller).map(item => item.seatIndex));
+    const capacity = task.purchase?.adapter.snapshot().config.seatsPerSeller ?? 1;
+    for (let index = 0; index < capacity; index++) {
+      if (occupied.has(index)) continue;
+      link.seatIndex = index;
+      return;
+    }
+  }
+
+  async function reportSellerLinks(task: Download, sellerId: string, eventId: string): Promise<void> {
+    const seatSessions = Object.fromEntries([...task.links.values()].flatMap(item => !item.closed
+      && item.quote?.sellerPublicKeyHex === sellerId && item.seatIndex !== undefined ? [[item.seatIndex, item.quote.sessionId]] : []));
+    traceBitfs("buyer.seller-links.report", () => ({
+      seedHashHex: task.seed, runId: task.runId, taskId: task.purchase?.id,
+      sellerId, eventId, seatSessions,
+      scheduler: task.purchase ? schedulerOwnership(task.purchase.adapter.snapshot()) : undefined,
+    }));
+    await event(task, eventId, { type: "seller", sellerId, online: Object.keys(seatSessions).length > 0, seatSessions });
+  }
+
+  async function publishSupplementalDemands(task: Download): Promise<void> {
+    const count = task.purchase?.adapter.snapshot().config.seatsPerSeller ?? 1;
+    await Promise.allSettled(Array.from({ length: count - 1 }, async () => {
+      task.supplementalPublishing++;
+      try {
+        const demand = await options.publishDemand(task.seed, task.controller.signal, id => {
+          assertCurrent(task);
+          task.supplementalDemands.add(id);
+        });
+        assertCurrent(task);
+        task.supplementalDemands.add(demand.requestMessageId);
+      } catch (error) {
+        if (!task.controller.signal.aborted) traceBitfs("buyer.seat.discovery.failed", () => ({ error }));
+      } finally {
+        task.supplementalPublishing--;
+      }
+    }));
+  }
+
+  async function cancelPreparedOpening(task: Download, sessionId: string, signal: AbortSignal): Promise<boolean> {
+    const record = await journalSessions.get(sessionId);
+    if (!record || record.phase === "cancelled") return true;
+    if (!["quote-selected", "opening-presign", "funding-prepared", "cancel-opening"].includes(record.phase)
+      || await journalSessions.getEvidence(sessionId, "kind3-opening-response")) return false;
+    if (record.phase !== "cancel-opening") {
+      await journalSessions.update(sessionId, record.revision, { phase: "cancel-opening" }, Date.now());
+    }
+    await options.funding(task.seed, signal).cancelUnfundedOpening(sessionId);
+    return true;
+  }
+
+  async function releaseUnfundedOpening(task: Download, poolId: string, commandId: string): Promise<void> {
+    const runtime = task.purchase!;
+    const pool = runtime.adapter.snapshot().pools[poolId]!;
+    const sessionId = await readSchedulerPoolSessionId(journalSessions, runtime.id, pool);
+    const record = await journalSessions.get(sessionId);
+    traceBitfs("buyer.release-opening.start", () => ({
+      seedHashHex: task.seed, runId: task.runId, taskId: runtime.id,
+      poolId, commandId, sessionId, phase: record?.phase,
+      pendingTxid: record?.pendingTxid, pendingAuthorizationId: record?.pendingAuthorizationId,
+      evidence: record?.evidence,
+      scheduler: schedulerOwnership(runtime.adapter.snapshot()),
+    }));
+    let released = false;
+    try {
+      released = await cancelPreparedOpening(task, sessionId, task.controller.signal);
+    } catch (error) {
+      traceBitfs("buyer.cancel-opening.failed", () => ({ sessionId, error }));
+    }
+    traceBitfs("buyer.release-opening.decision", () => ({
+      seedHashHex: task.seed, runId: task.runId, taskId: runtime.id,
+      poolId, commandId, sessionId, released,
+      scheduler: schedulerOwnership(runtime.adapter.snapshot()),
+    }));
+    await event(task, `closed-opening-${commandId}`, released
+      ? { type: "open-failed", poolId, commandId, released: true }
+      : { type: "unknown", poolId, commandId });
+    await runtime.adapter.settle(commandId);
+  }
+
   async function recoverCommands(task: Download, link: Link): Promise<void> {
     const runtime = task.purchase!;
     const sellerId = link.quote?.sellerPublicKeyHex;
@@ -444,7 +615,7 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
       const command = entry.command;
       if (command.type === "discover") continue;
       const pool = states.pools[command.poolId];
-      if (!pool || pool.sellerId !== sellerId) continue;
+      if (!pool || pool.sellerId !== sellerId || (pool.seatIndex ?? 0) !== link.seatIndex) continue;
       if (pool.funding === "failed" || (pool.funding === "closed" && pool.refundAvailable)) {
         await runtime.adapter.settle(command.commandId);
         continue;
@@ -474,24 +645,7 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
         }
         continue;
       }
-      // The exact seller approval is always saved before dispatching FundingTx.
-      // Confirm that the ledger and outbox also permit releasing this opening.
-      if (record) {
-        const funding = options.funding(task.seed, task.controller.signal);
-        if (!["cancel-opening", "cancelled"].includes(record.phase)) {
-          await journalSessions.update(sessionId, record.revision, { phase: "cancel-opening" }, Date.now());
-        }
-        try { await funding.cancelUnfundedOpening(sessionId); }
-        catch (error) {
-          traceBitfs("buyer.cancel-opening.failed", () => ({ sessionId, error }));
-          await event(task, `recover-open-unknown-${command.commandId}`, { type: "unknown", poolId: pool.id, commandId: command.commandId });
-          continue;
-        }
-      }
-      await event(task, `recover-open-released-${command.commandId}`, {
-        type: "open-failed", poolId: pool.id, commandId: command.commandId, released: true,
-      });
-      await runtime.adapter.settle(command.commandId);
+      await releaseUnfundedOpening(task, pool.id, command.commandId);
     }
   }
 
@@ -523,11 +677,14 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
       blockPrice: quote.fullBlockPriceSatoshis, seedPrice: quote.seedPriceSatoshis, tailPrice: quote.tailPriceSatoshis,
       maxBlocks: quote.maxBlocksPerBatch, fees,
     } });
-    if (!task.stopped) await event(task, `online-${quote.sessionId}`, { type: "seller", sellerId: quote.sellerPublicKeyHex, online: true });
+
   }
 
-  async function start(task: Download, selectedId: string, maximum?: string): Promise<void> {
-    if (task.purchase) return;
+  async function start(task: Download, selectedId: string, maximum?: string, requireNew = false): Promise<void> {
+    if (task.purchase) {
+      if (requireNew) throw new Error("文件已由另一下载任务处理");
+      return;
+    }
     if (task.expiresAtMs <= Date.now()) throw new Error("BitFS 报价等待已结束");
     const quotes = quoteViews(task);
     const selected = quotes.find(quote => quote.sessionId === selectedId);
@@ -544,28 +701,44 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
     if (!task.releaseSlot) throw new Error(`当前下载已达上限（${task.settings.maxConcurrentDownloads} 个文件）`);
     const tasks = createBitfsPurchaseTasks(journal, task.identity.owner, task.seed);
     const previous = (await tasks.list()).find(item => item.state === "active");
+    if (requireNew && previous) throw new Error("请先在钱包中续下原下载任务");
     const started = previous ?? await tasks.begin(selectedId, task.requestId!, Date.now(), selectedId);
     if (previous) await tasks.attach(previous.taskId, selectedId);
+    traceBitfs("buyer.start.begin", () => ({
+      seedHashHex: task.seed, runId: task.runId, taskId: started.taskId,
+      selectedSessionId: selectedId, demandId: started.demandId,
+      resumed: Boolean(previous), maxPrice, quoteSessionIds: quotes.map(quote => quote.sessionId),
+    }));
     const adapter = await SchedulerAdapter.open({
       store: createSchedulerSnapshotStore({ store: journal, ownerPublicKeyHex: task.identity.owner, network: task.identity.network, taskId: started.taskId }),
       clock, seedHash: task.seed,
       scheduler: sharedDownloadScheduler(`${task.identity.owner}|${task.identity.network}`, { ...task.settings, schedulerRequestTimeoutMs: 5_000 }),
+    }).catch(error => {
+      traceBitfs("buyer.scheduler.open.failed", () => ({
+        seedHashHex: task.seed, runId: task.runId, taskId: started.taskId, error,
+      }));
+      throw error;
     });
+    traceBitfs("buyer.scheduler.open.finish", () => ({
+      seedHashHex: task.seed, runId: task.runId, taskId: started.taskId,
+      scheduler: schedulerOwnership(adapter.snapshot()),
+    }));
     const original = started.sessionIds[0] && await journalSessions.getEvidence(started.sessionIds[0], "quote-summary");
     const manifest = original ? JSON.parse(new TextDecoder().decode(original)) as BitfsBuyerQuoteView : selected;
     const plan = createBitfsBuyerDownloadPlan({
       taskId: started.legacyPlan ? undefined : started.taskId, ownerPublicKeyHex: task.identity.owner, seedHashHex: task.seed,
       store: journal, fileSizeBytes: manifest.fileSizeBytes, recommendedFilename: manifest.recommendedFilename,
     });
-    const target = (seller: string, quoteId?: string): Link => {
+    const target = (seller: string, seatIndex: number): Link => {
       const link = [...task.links.values()].find(item => !item.closed && item.quote?.sellerPublicKeyHex === seller
-        && (quoteId === undefined || item.quote?.sessionId === quoteId));
+        && item.seatIndex === seatIndex);
       if (!link) throw new Error("卖家连接已关闭");
       return link;
     };
     const executor = new SchedulerCommandExecutor({
       openPool: async command => {
-        const link = target(command.sellerId, command.sessionId);
+        const pool = adapter.snapshot().pools[command.poolId]!;
+        const link = target(command.sellerId, pool.seatIndex ?? 0);
         const { sessionId } = await createSchedulerPoolSession({
           sessions: journalSessions, hostTaskId: started.taskId, poolId: command.poolId, quoteSessionId: command.sessionId, nowMs: Date.now(),
         });
@@ -577,16 +750,28 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
         const seed = adapter.snapshot().completed[task.seed] ? 0n : BigInt(command.quote.seedPrice);
         const reserve = await protocol.configureOpeningBudget({ sessionId, feeRate: BigInt(feeRate), arbitrationReserve: budget.arbitrationReserve });
         if (total + reserve !== budget.amount) throw new Error("开池预算与已确认费率不一致");
+        const transport = stream(task, link);
+        let openingSent = false;
         await protocol.startPurchase({
-          sessionId, stream: stream(task, link), openingAmountSatoshis: budget.amount.toString(),
+          sessionId,
+          stream: { async send(frame) {
+            await transport.send(frame);
+            openingSent = parse(frame).kind === 2;
+          } },
+          openingAmountSatoshis: budget.amount.toString(),
           contentBudgetSatoshis: total.toString(), seedBudgetSatoshis: seed.toString(),
           seedBudgetReserved: seed > 0n, blockBudgetSatoshis: (total - seed).toString(),
           mediaType: selectBitfsMediaType(quotes),
         });
+        if (openingSent) {
+          await event(task, `opening-sent-${pool.id}`,
+            { type: "opening-sent", poolId: pool.id, commandId: command.commandId })
+            .catch(error => traceBitfs("buyer.opening.sent-record.failed", () => ({ poolId: pool.id, error })));
+        }
       },
       dispatchDownload: async command => {
         const pool = adapter.snapshot().pools[command.poolId]!;
-        const link = target(pool.sellerId);
+        const link = target(pool.sellerId, pool.seatIndex ?? 0);
         const sessionId = await readSchedulerPoolSessionId(journalSessions, started.taskId, pool);
         const protocol = await protocolFor(task, link, sessionId);
         const quoteRaw = await journalSessions.getEvidence(command.quote.sessionId, "kind1-quote");
@@ -599,13 +784,22 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
       drainPool: async command => { await adapter.settle(command.commandId); },
       closePool: async command => {
         const pool = adapter.snapshot().pools[command.poolId]!;
-        const link = target(pool.sellerId);
+        const link = target(pool.sellerId, pool.seatIndex ?? 0);
         const sessionId = await readSchedulerPoolSessionId(journalSessions, started.taskId, pool);
         const protocol = await protocolFor(task, link, sessionId);
         await protocol.closeDispatchedPool({ sessionId, stream: stream(task, link) });
       },
     });
     task.purchase = { id: started.taskId, adapter, executor, plan, manifest };
+    for (const link of task.links.values()) assignSeat(task, link);
+    traceBitfs("buyer.start.ready", () => ({
+      seedHashHex: task.seed, runId: task.runId, taskId: started.taskId,
+      links: [...task.links.values()].map(link => ({
+        sessionId: link.offer.sessionId, sellerId: link.quote?.sellerPublicKeyHex,
+        quoteSessionId: link.quote?.sessionId, seatIndex: link.seatIndex, closed: link.closed,
+      })),
+      scheduler: schedulerOwnership(adapter.snapshot()),
+    }));
     if (previous) {
       for (const seller of Object.values(adapter.snapshot().sellers)) {
         await event(task, `reconnect-${task.runId}-${seller.id}`, { type: "seller", sellerId: seller.id, online: false });
@@ -616,15 +810,20 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
         if (link.quote && !link.closed) await recoverCommands(task, link);
       }
     }
-    for (const quote of quotes) {
-      if (!task.stopped) await quoteFact(task, quote);
+    for (const link of task.links.values()) {
+      if (!task.stopped && !link.closed && link.quote && link.seatIndex !== undefined) {
+        await quoteFact(task, link.quote);
+        await reportSellerLinks(task, link.quote.sellerPublicKeyHex, `open-link-${link.offer.sessionId}`);
+      }
     }
     if (task.stopped) return;
     await event(task, `price-${task.runId}`, { type: "slider", slider: "price", value: maxPrice });
+    void publishSupplementalDemands(task);
     await event(task, `run-${task.runId}`, { type: previous ? "resume" : "start" });
   }
 
   async function receive(task: Download, link: Link, input: BitfsBuyerTransportEvent): Promise<void> {
+    if (link.closed && input.type !== "closed") return;
     if (input.type === "progress") {
       if (typeof input.bytesIn !== "number") return;
       link.bytesIn = input.bytesIn;
@@ -638,7 +837,13 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
     if (input.type === "closed") {
       link.closed = true;
       if (task.purchase && link.quote) {
-        await event(task, `offline-${link.offer.sessionId}`, { type: "seller", sellerId: link.quote.sellerPublicKeyHex, online: false });
+        await reportSellerLinks(task, link.quote.sellerPublicKeyHex, `closed-link-${link.offer.sessionId}`);
+        if (link.seatIndex !== undefined && !task.stopped) {
+          for (const pool of Object.values(task.purchase.adapter.snapshot().pools)) {
+            if (pool.sellerId === link.quote.sellerPublicKeyHex && (pool.seatIndex ?? 0) === link.seatIndex
+              && pool.funding === "opening") await releaseUnfundedOpening(task, pool.id, pool.openCommandId);
+          }
+        }
       }
       return;
     }
@@ -650,10 +855,19 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
         sessionId: `quote-${crypto.randomUUID()}`, counterpartyPublicKeyHex: link.offer.publicKeyHex, rawKind1: input.frame,
       }, { ownerPublicKeyHex: task.identity.owner, seedHashHex: task.seed, sessions: journalSessions, generation: Date.now(), nowMs: Date.now, assertCurrentContext: () => assertCurrent(task) });
       if (task.purchase) {
+        assignSeat(task, link);
+        if (link.seatIndex === undefined) {
+          link.closed = true;
+          await link.offer.close();
+          return;
+        }
         await recoverCommands(task, link);
-        if (!task.stopped) await quoteFact(task, link.quote);
+        if (!task.stopped) {
+          await reportSellerLinks(task, link.quote.sellerPublicKeyHex, `open-link-${link.offer.sessionId}`);
+          await quoteFact(task, link.quote);
+        }
       }
-      else if (task.settings.buyerAutoPurchaseEnabled
+      else if (!task.manualPurchase && task.settings.buyerAutoPurchaseEnabled
         && BigInt(link.quote.fullBlockPriceSatoshis) <= BigInt(task.settings.maxFullBlockPriceSatoshis)) {
         try { await start(task, link.quote.sessionId); }
         catch (error) {
@@ -681,10 +895,22 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
     }
   }
 
-  async function publishBitfsDemand(seed: string, requireExisting = false): Promise<BitfsBuyerSnapshot> {
+  async function publishBitfsDemand(seed: string, requireExisting = false, manualPurchase = false): Promise<BitfsBuyerSnapshot> {
     if (!isValidSeed(seed)) throw new Error("BitFS Seed Hash 无效");
     lifecycle.throwIfAborted();
-    if (downloads.has(seed)) return snapshot(downloads.get(seed)!);
+    traceBitfs("buyer.demand.start", () => ({
+      seedHashHex: seed, requireExisting, manualPurchase,
+      hasLiveTask: downloads.has(seed),
+    }));
+    const current = downloads.get(seed);
+    if (current) {
+      if (manualPurchase && !current.purchase && !current.manualPurchase) throw new Error("钱包已在查找这个文件");
+      traceBitfs("buyer.demand.reuse", () => ({
+        seedHashHex: seed, runId: current.runId, taskId: current.purchase?.id,
+        requestMessageId: current.requestId,
+      }));
+      return snapshot(current);
+    }
     const identity = options.identity();
     const release = await options.tryLock(downloadLockKey(identity.owner, identity.network, seed));
     if (!release) return readOther(seed);
@@ -702,8 +928,8 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
       const finished = new Promise<void>(resolve => { completeStop = resolve; });
       const settings = await options.settings();
       task = {
-        identity, seed, settings, release, finished, completeStop, runId: crypto.randomUUID(),
-        controller: new AbortController(), links: new Map(), expiresAtMs: Date.now() + SEARCH_TIMEOUT_MS, tail: Promise.resolve(),
+        identity, seed, settings, manualPurchase, release, finished, completeStop, runId: crypto.randomUUID(),
+        controller: new AbortController(), links: new Map(), supplementalDemands: new Set(), supplementalPublishing: 0, expiresAtMs: Date.now() + SEARCH_TIMEOUT_MS, tail: Promise.resolve(),
       };
       downloads.set(seed, task);
       const currentTask = task;
@@ -715,6 +941,10 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
       if (currentTask.requestId && currentTask.requestId !== demand.requestMessageId) throw new Error("BitFS 需求编号冲突");
       currentTask.requestId = demand.requestMessageId;
       currentTask.expiresAtMs = demand.expiresAtMs;
+      traceBitfs("buyer.demand.published", () => ({
+        seedHashHex: seed, runId: currentTask.runId,
+        requestMessageId: demand.requestMessageId, expiresAtMs: demand.expiresAtMs,
+      }));
       currentTask.timer = setTimeout(() => {
         if (!currentTask.purchase || !currentTask.links.size) {
           void serial(currentTask, () => stopNormally(currentTask)).catch(error => drop(currentTask, error));
@@ -732,14 +962,119 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
     for (const task of downloads.values()) void drop(task);
   }, { once: true });
   return {
+    async readPlaybackRange(seed: string, taskId: string, offset: number, length: number, signal: AbortSignal): Promise<BitfsPlaybackRange> {
+      if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0 ||
+          length > PLAYBACK_BLOCK_BYTES || !Number.isSafeInteger(offset + length)) throw new Error("无效的 BitFS 播放范围");
+      lifecycle.throwIfAborted();
+      signal.throwIfAborted();
+      const identity = options.identity();
+      const live = downloads.get(seed);
+      const running = live?.purchase?.id === taskId ? live.purchase : undefined;
+      const tasks = await createBitfsPurchaseTasks(journal, identity.owner, seed).list();
+      const task = tasks.find(row => row.taskId === taskId);
+      if (!task) return {};
+      const scheduler = running?.adapter.snapshot() ?? (await createSchedulerSnapshotStore({
+        store: journal, ownerPublicKeyHex: identity.owner, network: identity.network, taskId,
+      }).load())?.snapshot.state;
+      if (scheduler?.seedHash !== seed || !scheduler.manifest) return {};
+      const seedObject = await content.get(`bitfs-staging/by-seed/${seed}/seed.bin`, { signal });
+      if (!seedObject) return {};
+      const hashes = await readVerifiedSeed(seed, seedObject.bytes);
+      const quoteBytes = task.sessionIds[0] && await journalSessions.getEvidence(task.sessionIds[0], "quote-summary");
+      const quote = quoteBytes ? JSON.parse(new TextDecoder().decode(quoteBytes)) as BitfsBuyerQuoteView : undefined;
+      const fileSizeBytes = Number(running?.manifest.fileSizeBytes ?? quote?.fileSizeBytes);
+      if (!Number.isSafeInteger(fileSizeBytes) || fileSizeBytes < 0 || Math.ceil(fileSizeBytes / PLAYBACK_BLOCK_BYTES) !== hashes.length) {
+        throw new Error("BitFS 播放长度与已验收 Seed 不匹配");
+      }
+      const meta = { fileSizeBytes, mediaType: quote?.mediaType };
+      const end = Math.min(offset + length, fileSizeBytes);
+      if (offset >= end) return meta;
+      const first = Math.floor(offset / PLAYBACK_BLOCK_BYTES);
+      const last = Math.floor((end - 1) / PLAYBACK_BLOCK_BYTES);
+      const required = hashes.slice(first, last + 1);
+      if (required.some(hash => !scheduler.completed[hash])) {
+        if (live && running) {
+          const preferred = [...new Set(hashes.slice(first, last + 4))];
+          const current = live.playbackPriority ?? scheduler.priorityBlocks ?? [];
+          if (preferred.length !== current.length || preferred.some((hash, index) => hash !== current[index])) {
+            live.playbackPriority = preferred;
+            void serial(live, async () => {
+              if (signal.aborted || live.playbackPriority !== preferred) return;
+              await event(live, `playback-${crypto.randomUUID()}`, { type: "prioritize-blocks", blockHashes: preferred });
+            }).catch(error => {
+              if (!live.controller.signal.aborted) traceBitfs("buyer.playback.priority.failed", () => ({ error }));
+            }).finally(() => {
+              if (live.playbackPriority === preferred) live.playbackPriority = undefined;
+            });
+          }
+        }
+        return meta;
+      }
+      const result = new Uint8Array(end - offset);
+      let written = 0;
+      for (let index = first; index <= last; index++) {
+        const hash = hashes[index]!;
+        const block = await content.get(`bitfs-staging/by-seed/${seed}/blocks/${hash}.bin`, { signal });
+        if (!block) return meta;
+        verifyBlock(block.bytes, Digest.fromHex(hash));
+        const base = index * PLAYBACK_BLOCK_BYTES;
+        if (block.bytes.length !== Math.min(PLAYBACK_BLOCK_BYTES, fileSizeBytes - base)) {
+          throw new Error("BitFS 播放 Block 长度无效");
+        }
+        const part = block.bytes.subarray(Math.max(0, offset - base), Math.min(block.bytes.length, end - base));
+        result.set(part, written);
+        written += part.length;
+      }
+      const current = options.identity();
+      if (current.generation !== identity.generation || current.owner !== identity.owner || current.network !== identity.network) {
+        throw new Error("BitFS 下载身份已变化");
+      }
+      signal.throwIfAborted();
+      return { ...meta, bytes: result };
+    },
     registerOffer(offer: BitfsBuyerOffer): AbortSignal | undefined {
       const task = downloads.get(offer.seedHashHex);
-      if (!task || task.controller.signal.aborted || Date.now() >= task.expiresAtMs
-        || (task.requestId ? task.requestId !== offer.requestMessageId : !options.acceptOfferBeforePublishResult)) return undefined;
-      task.requestId = offer.requestMessageId;
+      traceBitfs("buyer.offer.received", () => ({
+        seedHashHex: offer.seedHashHex, sessionId: offer.sessionId,
+        requestMessageId: offer.requestMessageId, sellerPublicKeyHex: offer.publicKeyHex,
+        hasTask: Boolean(task), taskRequestId: task?.requestId,
+        supplementalPublishing: task?.supplementalPublishing,
+      }));
+      if (!task || task.controller.signal.aborted || Date.now() >= task.expiresAtMs) {
+        traceBitfs("buyer.offer.rejected", () => ({
+          seedHashHex: offer.seedHashHex, sessionId: offer.sessionId,
+          reason: !task ? "no-task" : task.controller.signal.aborted ? "aborted" : "expired",
+        }));
+        return undefined;
+      }
+      if (!task.requestId) {
+        if (!options.acceptOfferBeforePublishResult) {
+          traceBitfs("buyer.offer.rejected", () => ({
+            seedHashHex: offer.seedHashHex, sessionId: offer.sessionId, reason: "early-offer-disabled",
+          }));
+          return undefined;
+        }
+        task.requestId = offer.requestMessageId;
+      } else if (task.requestId !== offer.requestMessageId && !task.supplementalDemands.has(offer.requestMessageId)) {
+        // The wallet Coordinator has already authenticated and bound early offers to
+        // this page's publish request; its callback can arrive before publish returns.
+        if (!options.acceptOfferBeforePublishResult || task.supplementalPublishing === 0) {
+          traceBitfs("buyer.offer.rejected", () => ({
+            seedHashHex: offer.seedHashHex, sessionId: offer.sessionId,
+            requestMessageId: offer.requestMessageId, taskRequestId: task.requestId,
+            reason: "unbound-demand",
+          }));
+          return undefined;
+        }
+        task.supplementalDemands.add(offer.requestMessageId);
+      }
       const link = { offer, protocols: new Map(), closed: false };
       task.links.set(offer.sessionId, link);
       frames.set(offer.sessionId, { task, link });
+      traceBitfs("buyer.offer.accepted", () => ({
+        seedHashHex: offer.seedHashHex, sessionId: offer.sessionId,
+        requestMessageId: offer.requestMessageId, runId: task.runId,
+      }));
       return task.controller.signal;
     },
     async onTransportEvent(input: BitfsBuyerTransportEvent): Promise<boolean> {
@@ -750,18 +1085,31 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
       else void handling;
       return input.type !== "closed";
     },
-    download: (seed: string) => publishBitfsDemand(seed),
+    download: (seed: string, manualPurchase = false) => publishBitfsDemand(seed, false, manualPurchase),
     resume: (seed: string) => publishBitfsDemand(seed, true),
     async getDownload(seed: string) {
       const task = downloads.get(seed);
       return task ? snapshot(task) : readOther(seed);
     },
-    async startPurchase(seed: string, sessionId: string, max?: string) {
+    async startPurchase(seed: string, sessionId: string, max?: string, requireNew = false) {
       const task = downloads.get(seed);
       if (!task) throw new Error("BitFS 下载需求不属于当前实例");
+      traceBitfs("buyer.purchase.request", () => ({
+        seedHashHex: seed, runId: task.runId, quoteSessionId: sessionId,
+        max, requireNew, taskId: task.purchase?.id,
+      }));
+      let alreadyRunning = false;
       try {
-        await serial(task, () => start(task, sessionId, max));
+        await serial(task, () => {
+          alreadyRunning = Boolean(task.purchase);
+          return start(task, sessionId, max, requireNew);
+        });
       } catch (error) {
+        traceBitfs("buyer.purchase.request.failed", () => ({
+          seedHashHex: seed, runId: task.runId, quoteSessionId: sessionId,
+          taskId: task.purchase?.id, error,
+        }));
+        if (requireNew && alreadyRunning) throw error;
         if (task.purchase) await drop(task, error);
         else {
           task.releaseSlot?.();
@@ -769,7 +1117,21 @@ export function createBitfsBuyer(options: BitfsBuyerOptions) {
         }
         throw error;
       }
+      traceBitfs("buyer.purchase.request.finish", () => ({
+        seedHashHex: seed, runId: task.runId, taskId: task.purchase?.id,
+        quoteSessionId: sessionId,
+      }));
       return snapshot(task);
+    },
+    async setDownloadPrice(seed: string, taskId: string, max: string, signal: AbortSignal) {
+      const task = downloads.get(seed);
+      if (!task) throw new Error("下载任务未运行");
+      await serial(task, async () => {
+        signal.throwIfAborted();
+        assertCurrent(task);
+        if (task.purchase?.id !== taskId || task.stopped || task.closing) throw new Error("下载任务未运行");
+        await event(task, `price-${crypto.randomUUID()}`, { type: "slider", slider: "price", value: max });
+      });
     },
     async withdrawDemand(seed: string) {
       const task = downloads.get(seed);

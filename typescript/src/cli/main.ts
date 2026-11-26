@@ -184,7 +184,7 @@ async function serve(config: Config, wallet: Wallet, host: Libp2p,
       discovery: {
       signer: wallet.signer, journal: createBitfsJournal(journal), sessions, nowMs,
       findContent: async hash => catalog.find(hash), selectTransport: routes,
-      settings: () => ({ sellerEnabled: !stop.aborted, seedPriceSatoshis: config.SeedPrice,
+      settings: () => ({ seedPriceSatoshis: config.SeedPrice,
         fullBlockPriceSatoshis: config.BlockPrice, maxBlocksPerBatch: 64, quoteLifetimeSeconds: 300,
         supportedArbiterPublicKeys: config.Arbiters.map(item => item.publicKeyHex) }),
     },

@@ -4,7 +4,7 @@ import {
   createDownloadScheduler,
   nextWakeAt, restoreTask, step, view,
   type Command, type Config, type CreateTaskInput, type DownloadScheduler,
-  type Event, type Payload, type State, type View,
+  type Event, type Payload, type Result, type State, type View,
 } from "keymaster-trade-scheduler";
 import { traceBitfs } from "../debug.js";
 import { MonotonicClock, schedulerEventTimes } from "./clock.js";
@@ -70,9 +70,33 @@ export class SchedulerAdapter {
 
   /** 恢复已有快照；没有则以设置建新任务并立即落盘。 */
   static async open(init: SchedulerAdapterInit & { scheduler: DownloadScheduler }): Promise<SchedulerAdapter> {
-    const stored = await init.store.load();
+    traceBitfs("scheduler.open.start", () => ({ seedHash: init.seedHash }));
+    const stored = await init.store.load().catch(error => {
+      traceBitfs("scheduler.open.load.failed", () => ({ seedHash: init.seedHash, error }));
+      throw error;
+    });
     if (stored) {
-      const state = restoreTask(stored.snapshot.state);
+      traceBitfs("scheduler.open.restore.start", () => ({
+        seedHash: init.seedHash, revision: stored.snapshot.revision,
+        stateRevision: stored.snapshot.state.revision,
+        pools: Object.keys(stored.snapshot.state.pools).length,
+        requests: Object.keys(stored.snapshot.state.requests).length,
+        outbox: stored.snapshot.outbox.length,
+      }));
+      let state: State;
+      try {
+        state = restoreTask(stored.snapshot.state);
+      } catch (error) {
+        traceBitfs("scheduler.open.restore.failed", () => ({
+          seedHash: init.seedHash, revision: stored.snapshot.revision,
+          state: stored.snapshot.state, error,
+        }));
+        throw error;
+      }
+      traceBitfs("scheduler.open.restore.finish", () => ({
+        seedHash: init.seedHash, revision: state.revision,
+        pools: Object.keys(state.pools).length, requests: Object.keys(state.requests).length,
+      }));
       return new SchedulerAdapter(init.store, init.clock, state, stored.snapshot.outbox.map((entry) => ({ ...entry })));
     }
     const create: CreateTaskInput = { seedHash: init.seedHash };
@@ -83,7 +107,16 @@ export class SchedulerAdapter {
       };
     }
     const state = init.scheduler.createTask(create);
-    const saved = await init.store.save({ state, outbox: [] });
+    traceBitfs("scheduler.open.create", () => ({
+      seedHash: init.seedHash, state, resume: create.resume !== undefined,
+    }));
+    const saved = await init.store.save({ state, outbox: [] }).catch(error => {
+      traceBitfs("scheduler.open.save.failed", () => ({ seedHash: init.seedHash, error }));
+      throw error;
+    });
+    traceBitfs("scheduler.open.finish", () => ({
+      seedHash: init.seedHash, revision: saved.snapshot.state.revision, created: true,
+    }));
     return new SchedulerAdapter(init.store, init.clock, saved.snapshot.state, []);
   }
 
@@ -97,19 +130,36 @@ export class SchedulerAdapter {
       const receivedAt = this.clock.now();
       const times = schedulerEventTimes(input.occurredAt ?? receivedAt, receivedAt);
       const event = { ...input.payload, eventId: input.eventId, seedHash: this.state.seedHash, ...times } as Event;
-      traceBitfs("scheduler.event.start", () => ({seedHash: this.state.seedHash, revision: this.state.revision, event}));
-      const result = step(this.state, event);
+      traceBitfs("scheduler.event.start", () => ({seedHash: this.state.seedHash, revision: this.state.revision, event,
+        pools: this.state.pools, requests: this.state.requests}));
+      let result: Result;
+      try {
+        result = step(this.state, event);
+      } catch (error) {
+        traceBitfs("scheduler.event.failed", () => ({
+          seedHash: this.state.seedHash, eventId: event.eventId, event,
+          state: this.state, error,
+        }));
+        throw error;
+      }
       const next = [...this.outbox];
       for (const command of result.commands) {
         if (!next.some((entry) => entry.commandId === command.commandId)) {
           next.push({ commandId: command.commandId, type: command.type, revision: command.revision, command });
         }
       }
-      await this.store.save({ state: result.state, outbox: next });
+      await this.store.save({ state: result.state, outbox: next }).catch(error => {
+        traceBitfs("scheduler.event.save.failed", () => ({
+          seedHash: this.state.seedHash, eventId: event.eventId,
+          nextRevision: result.state.revision, error,
+        }));
+        throw error;
+      });
       this.state = result.state;
       this.outbox = next;
       traceBitfs("scheduler.event.committed", () => ({seedHash: this.state.seedHash, eventId: event.eventId,
-        revision: this.state.revision, failure: this.state.failure, commands: result.commands, pools: this.state.pools, spent: this.state.spent,
+        revision: this.state.revision, failure: this.state.failure, commands: result.commands,
+        pools: this.state.pools, requests: this.state.requests, spent: this.state.spent,
         pendingCommandIds: next.map(entry => entry.commandId)}));
       return result.commands;
     });

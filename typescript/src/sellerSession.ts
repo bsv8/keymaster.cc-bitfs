@@ -203,7 +203,7 @@ export class BitfsSellerSessionManager {
       throw error;
     }
     if (epochAtStart !== this.epoch || !this.sessions.has(input.sessionId) || !this.deps.isCurrent()) {
-      // 拨号期间发生锁定/切 Key/关闭卖方：不得留下已连接会话。
+      // 拨号期间撤销运行态时，不得留下已连接会话。
       await this.deps.transport.close(input.sessionId, "generation_revoked").catch(() => undefined);
       return false;
     }
@@ -292,7 +292,7 @@ export class BitfsSellerSessionManager {
   }
 
   /**
-   * 撤销全部会话：锁定、切 Key、切存储、关闭卖方或 Worker 重建时调用。
+   * 撤销全部会话：宿主撤销或重建运行态时调用。
    * 迟到帧在 clear 之后不再进入协议端口。
    */
   clear(): void {

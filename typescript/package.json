@@ -1,6 +1,7 @@
 {
   "name": "keymaster-bitfs",
-  "version": "0.1.0",
+  "packageManager": "pnpm@11.5.1",
+  "version": "0.2.0",
   "type": "module",
   "exports": {
     ".": {

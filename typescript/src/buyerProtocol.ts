@@ -37,6 +37,7 @@ import { deriveBitfsPoolRefundLockHeight } from "./poolLockTime.js";
 import { bitfsPoolSettlementFee } from "./poolBudget.js";
 import { bitfsTxidHex } from "./txid.js";
 import { Digest, readBlockHash, verifySeed } from "masterseed";
+import { traceBitfs } from "./debug.js";
 
 
 const PURCHASE_MANIFEST_FORMAT = "keymaster.bitfs-purchase-manifest";
@@ -438,6 +439,13 @@ export class BitfsBuyerProtocol {
       throw new Error("该 BitFS 报价已进入购买流程或无法恢复");
     }
     const quoteRaw = await this.requiredEvidence(record.sessionId, "kind1-quote");
+    traceBitfs("buyer.protocol.start.begin", () => ({
+      sessionId: record.sessionId, phase: record.phase, revision: record.revision,
+      seedHashHex: record.seedHashHex,
+      openingAmountSatoshis: input.openingAmountSatoshis,
+      contentBudgetSatoshis: input.contentBudgetSatoshis,
+      evidence: record.evidence,
+    }));
     const quote = acceptBuyerQuote(bitfsWorkflowFacts(this.deps.nowMs()), quoteRaw);
     // fileSizeBytes 仅为报价声明的展示信息（未知统一为 0），不得据此判断文件为空；
     // 空与否以已验证 Seed 的空清单确定。恢复清单同样允许 "0"。
@@ -503,9 +511,21 @@ export class BitfsBuyerProtocol {
         await this.deps.sessions.putEvidence(record.sessionId, current.revision, "arbitration-endpoint", new TextEncoder().encode(JSON.stringify({ publicKeyHex: selected.publicKeyHex, address: selected.address })), this.deps.nowMs());
       }
       if (!arbiterPublicKeyHex) throw new Error("签名报价没有支持的仲裁方，不能安全开池");
+      traceBitfs("buyer.protocol.blockHeight.start", () => ({
+        sessionId: record.sessionId, arbiterPublicKeyHex,
+        phase: record.phase, evidence: record.evidence,
+      }));
       const currentBlockHeight = await this.deps.blockHeight();
+      traceBitfs("buyer.protocol.blockHeight.finish", () => ({
+        sessionId: record.sessionId, height: currentBlockHeight,
+      }));
       this.deps.assertCurrentContext();
       const expiryLockTime = deriveBitfsPoolRefundLockHeight(currentBlockHeight, this.deps.refundDelayBlocks);
+      traceBitfs("buyer.protocol.prepareOpening.start", () => ({
+        sessionId: record.sessionId, openingAmountSatoshis,
+        expiryLockTime, minerFeeRateSatoshisPerKilobyte: this.deps.minerFeeRateSatoshisPerKilobyte.toString(10),
+        arbiterPublicKeyHex,
+      }));
       const rawKind2 = await this.deps.task.prepareOpening({
         sessionId: record.sessionId,
         openingAmountSatoshis,
@@ -513,8 +533,19 @@ export class BitfsBuyerProtocol {
         minerFeeRateSatoshisPerKilobyte: this.deps.minerFeeRateSatoshisPerKilobyte,
         arbiterPublicKeyHex,
       });
+      const preparedRecord = await this.requiredSession(record.sessionId);
+      traceBitfs("buyer.protocol.prepareOpening.finish", () => ({
+        sessionId: record.sessionId, kind2Bytes: rawKind2.byteLength,
+        phase: preparedRecord.phase, evidence: preparedRecord.evidence,
+      }));
       this.deps.assertCurrentContext();
+      traceBitfs("buyer.protocol.kind2.send.start", () => ({
+        sessionId: record.sessionId, kind2Bytes: rawKind2.byteLength,
+      }));
       await input.stream.send(rawKind2);
+      traceBitfs("buyer.protocol.kind2.send.finish", () => ({
+        sessionId: record.sessionId, kind2Bytes: rawKind2.byteLength,
+      }));
       this.progress(record.sessionId, "opening", openingAmountSatoshis, 0, totalBlockCount, "已发送开池预签请求，等待卖方 Kind 3");
       return this.snapshot(record.sessionId, "opening", openingAmountSatoshis, 0, totalBlockCount, "等待卖方预签");
     } catch (error) {
@@ -592,7 +623,7 @@ export class BitfsBuyerProtocol {
     if (result.outcome.status === "failed") throw new Error("BitFS 开池资金交易未广播");
     if (!result.kind4) {
       this.progress(sessionId, "funding-unknown", amount, 0, totalBlocks, "开池交易结果未知，已保留原交易供手动处理");
-      throw new Error("BitFS 开池结果待处理");
+      throw Object.assign(new Error("BitFS 开池结果待处理"), { code: "funding-unknown" });
     }
     await stream.send(result.kind4);
     await this.deps.onPoolUsable?.({ sessionId });
@@ -1395,9 +1426,20 @@ export class BitfsBuyerProtocol {
   private async markFailed(sessionId: string, amount: string, total: number | null, error: unknown): Promise<void> {
     const message = error instanceof Error ? error.message : "BitFS 买方流程失败";
     const record = await this.deps.sessions.get(sessionId);
+    traceBitfs("buyer.protocol.markFailed.start", () => ({
+      sessionId, amount, total, phase: record?.phase, evidence: record?.evidence,
+      pendingTxid: record?.pendingTxid, pendingAuthorizationId: record?.pendingAuthorizationId,
+      error, message,
+    }));
     if (record && record.phase !== "failed") {
       await this.deps.sessions.update(sessionId, record.revision, { phase: "failed", failureCode: "buyer-purchase-failed", failureMessage: message.slice(0, 2048) }, this.deps.nowMs()).catch(() => undefined);
     }
+    const failedRecord = await this.deps.sessions.get(sessionId);
+    traceBitfs("buyer.protocol.markFailed.finish", () => ({
+      sessionId, amount, total, phase: failedRecord?.phase,
+      failureCode: failedRecord?.failureCode, failureMessage: failedRecord?.failureMessage,
+      evidence: failedRecord?.evidence,
+    }));
     // 先提交失败事件，再通知任务生命周期，避免读到旧阶段漏掉结束。
     this.progress(sessionId, "failed", amount, 0, total, message);
   }

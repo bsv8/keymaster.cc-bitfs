@@ -233,7 +233,26 @@ export class BitfsSellerProtocol implements BitfsSellerProtocolPort {
         const active = (await this.deps.sessions.list()).filter(item => item.role === "seller"
           && item.ownerPublicKeyHex === record.ownerPublicKeyHex && item.evidence.includes("kind2-opening-request")
           && !["closed", "failed", "arbitration-prepared", "arbitration-payment-unknown"].includes(item.phase));
-        if (active.length >= this.deps.maxConcurrentSales()) return { type: "close", reason: "seller_capacity" };
+        const limit = this.deps.maxConcurrentSales();
+        let occupied = active.length;
+        // The buyer may have observed a settlement after the seller returned Kind 13.
+        // Reconcile its exact close txid before rejecting a new pool for the same buyer.
+        for (const item of active) {
+          if (occupied < limit) break;
+          if (item.phase !== "close-unknown" || item.counterpartyPublicKeyHex !== record.counterpartyPublicKeyHex) continue;
+          await this.serial(item.sessionId, async () => {
+            const closing = await this.requiredRecord(item.sessionId);
+            if (closing.phase === "closed") { occupied--; return; }
+            if (closing.phase !== "close-unknown" || !closing.pendingTxid) return;
+            const outcome = await this.deps.broadcaster.reconcile(closing.pendingTxid);
+            this.assertCurrent(record);
+            if (outcome.status === "confirmed") {
+              await this.deps.sessions.update(closing.sessionId, closing.revision, { phase: "closed", pendingTxid: undefined }, this.deps.nowMs());
+              occupied--;
+            }
+          });
+        }
+        if (occupied >= limit) return { type: "close", reason: "seller_capacity" };
       }
       record = await this.deps.sessions.putEvidence(record.sessionId, record.revision, "kind2-opening-request", input.bytes, this.deps.nowMs());
       // SDK 先验证 Kind 2 模板、角色和买方签名，再进入钱包签名门禁。

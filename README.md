@@ -8,7 +8,7 @@ TypeScript and Go libraries for BitFS buyers and sellers. Hosts supply authentic
 
 ## Standalone commands
 
-Build the Go CLI with `go build ./cmd/bitfs`. Build the TypeScript CLI with `npm ci` and `npm run build` in `typescript/`, then run `node dist/cli/main.js`. The Node CLI uses the system `flock` command for workspace ownership.
+Build the Go CLI with `go build ./cmd/bitfs`. Build the TypeScript CLI with `pnpm install --frozen-lockfile` and `pnpm run build` in `typescript/`, then run `node dist/cli/main.js`. The Node CLI uses the system `flock` command for workspace ownership.
 
 Both executables accept the same commands. A stopped buyer keeps its workspace, including approved payments and pending settlement evidence. Deleting the workspace's download data leaves the output path under the host's ownership.
 
