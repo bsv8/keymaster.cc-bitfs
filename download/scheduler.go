@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -67,6 +68,8 @@ type Options struct {
 	// Ready is called once the scheduler is running. It receives a thread-safe
 	// event feed for live controls (price slider) and returns a stop function.
 	Ready func(feed func(scheduler.Event) error) (stop func())
+	// PlaybackReady exposes range reads for this execution until Run stops.
+	PlaybackReady func(PlaybackReader) (stop func())
 	// Stop requests a bounded drain and leaves this execution resumable.
 	Stop            <-chan struct{}
 	StopTimeout     time.Duration
@@ -105,8 +108,9 @@ func (s *quoteSource) Quote(_ context.Context, sellerID, sessionID string) (*hos
 
 // sessionPeer carries exact artifacts over one BitFS transport session.
 type sessionPeer struct {
-	mu      sync.Mutex
-	session bitfs.PurchaseSession
+	mu        sync.Mutex
+	session   bitfs.PurchaseSession
+	onFailure func()
 }
 
 func (p *sessionPeer) write(kind wire.Kind, raw []byte) error {
@@ -114,12 +118,19 @@ func (p *sessionPeer) write(kind wire.Kind, raw []byte) error {
 	if err != nil {
 		return err
 	}
-	return p.session.Write(artifact)
+	err = p.session.Write(artifact)
+	if err != nil && p.onFailure != nil {
+		p.onFailure()
+	}
+	return err
 }
 
 func (p *sessionPeer) expect(kind wire.Kind) ([]byte, error) {
 	artifact, err := p.session.Read()
 	if err != nil {
+		if p.onFailure != nil {
+			p.onFailure()
+		}
 		return nil, err
 	}
 	if artifact.Kind() != kind {
@@ -321,7 +332,7 @@ func Run(ctx context.Context, options Options) (*bitfs.PurchaseResult, error) {
 		versionsMu      sync.Mutex
 		versions        = map[string]int64{}
 		arbitrationFees = map[string]arbitration.Info{}
-		latestSeller    = map[string]*sessionPeer{}
+		sellerSessions  = map[string]map[string]string{}
 		manifestOnce    bool
 		votesMu         sync.Mutex
 		votes           = map[string]string{}
@@ -334,6 +345,18 @@ func Run(ctx context.Context, options Options) (*bitfs.PurchaseResult, error) {
 			return nil, fmt.Errorf("download: no session for %s", sessionID)
 		}
 		return peer, nil
+	}
+	// All seat mappings are published under the same lock as their updates.
+	// Removing one failed connection leaves the other seats online.
+	reportSeats := func(sellerID, eventID string) error {
+		sessions := make(map[string]string, len(sellerSessions[sellerID]))
+		for seat, id := range sellerSessions[sellerID] {
+			sessions[seat] = id
+		}
+		return loop.Feed(ctx, scheduler.Event{
+			EventID: eventID, Type: "seller", SellerID: sellerID,
+			Online: boolPointer(len(sessions) > 0), SeatSessions: &sessions,
+		})
 	}
 	// readSession accepts one seller session and reads its Kind 1 quote.
 	readSession := func(readCtx context.Context) (string, string, *content.FileQuoteTerms, error) {
@@ -424,15 +447,70 @@ func Run(ctx context.Context, options Options) (*bitfs.PurchaseResult, error) {
 			options.OnRecommendations(ranked)
 		}
 		peer := &sessionPeer{session: session}
+		peer.onFailure = func() {
+			peersMu.Lock()
+			defer peersMu.Unlock()
+			delete(peers, sessionID)
+			delete(sessionSet, session)
+			_ = session.Close()
+			seats := sellerSessions[sellerID]
+			for seat, id := range seats {
+				if id == sessionID {
+					delete(seats, seat)
+					if err := reportSeats(sellerID, "seller-closed-"+sessionID); err != nil && ctx.Err() == nil {
+						logf("更新卖家席位失败: %v", err)
+					}
+					break
+				}
+			}
+		}
 		peersMu.Lock()
 		peers[sessionID] = peer
-		latestSeller[sellerID] = peer
 		peersMu.Unlock()
 		return sellerID, sessionID, terms, nil
 	}
 	// feedQuote publishes a verified session quote to the kernel. The tail
 	// price is the seller-signed quote value, used directly without derivation.
+	var seatCount int64
 	feedQuote := func(sellerID, sessionID string, terms *content.FileQuoteTerms) error {
+		peersMu.Lock()
+		defer peersMu.Unlock()
+		peer := peers[sessionID]
+		if peer == nil {
+			return nil
+		}
+		seats, known := sellerSessions[sellerID]
+		if !known {
+			seats = make(map[string]string)
+			sellerSessions[sellerID] = seats
+			if err := reportSeats(sellerID, "seller-init-"+sessionID); err != nil {
+				return err
+			}
+		}
+		seat := ""
+		for index := int64(0); index < seatCount; index++ {
+			key := strconv.FormatInt(index, 10)
+			id := seats[key]
+			if id == "" {
+				seat = key
+				break
+			}
+			// A fresh quote can take over an expired seat. Keep the old
+			// connection available to the pools already bound to it.
+			if old, err := quotes.Quote(ctx, sellerID, id); err == nil &&
+				old.ExpiresAtUnix <= options.Task.Facts().Now.Unix() {
+				seat = key
+				break
+			}
+		}
+		if seat == "" {
+			delete(peers, sessionID)
+			if session, ok := peer.session.(Session); ok {
+				delete(sessionSet, session)
+			}
+			_ = peer.session.Close()
+			return nil
+		}
 		versionsMu.Lock()
 		versions[sellerID]++
 		version := versions[sellerID]
@@ -475,7 +553,8 @@ func Run(ctx context.Context, options Options) (*bitfs.PurchaseResult, error) {
 		if err := loop.Feed(ctx, scheduler.Event{EventID: eventID, Type: "quote", Quote: &quote}); err != nil {
 			return err
 		}
-		return loop.Feed(ctx, scheduler.Event{EventID: "seller-" + sessionID, Type: "seller", SellerID: sellerID, Online: boolPointer(true)})
+		seats[seat] = sessionID
+		return reportSeats(sellerID, "seller-"+sessionID)
 	}
 	// 连接接收器只观察真实新报价；席位、换人和是否重发需求均由内核决定。
 	intake := func() {
@@ -522,10 +601,10 @@ func Run(ctx context.Context, options Options) (*bitfs.PurchaseResult, error) {
 		limits.MaxBlockPrice = new(big.Int).SetUint64(firstTerms.FullBlockPriceSatoshis).String()
 	}
 	if limits.BaseSeats < 1 {
-		limits.BaseSeats = 1
+		limits.BaseSeats = 6
 	}
 	if limits.FloatingSeats < 1 {
-		limits.FloatingSeats = 1
+		limits.FloatingSeats = 2
 	}
 	if limits.PoolBlocks < 1 {
 		limits.PoolBlocks = 4
@@ -598,8 +677,18 @@ func Run(ctx context.Context, options Options) (*bitfs.PurchaseResult, error) {
 		RecoverPeer: func(sellerID string) (host.Peer, error) {
 			peersMu.Lock()
 			defer peersMu.Unlock()
-			if peer := latestSeller[sellerID]; peer != nil {
-				return peer, nil
+			for i := int64(0); i < seatCount; i++ {
+				id := sellerSessions[sellerID][strconv.FormatInt(i, 10)]
+				if peer := peers[id]; peer != nil {
+					return peer, nil
+				}
+			}
+			// The first connection is already verified when the
+			// loop starts replaying the persisted outbox.
+			if sellerID == firstSeller && len(sellerSessions[sellerID]) == 0 {
+				if peer := peers[firstSession]; peer != nil {
+					return peer, nil
+				}
 			}
 			return nil, fmt.Errorf("download: seller %s is offline", sellerID)
 		},
@@ -649,11 +738,14 @@ func Run(ctx context.Context, options Options) (*bitfs.PurchaseResult, error) {
 	}
 	ports.Feed = func(event scheduler.Event) error { return loop.Feed(ctx, event) }
 	ports.Settle = loop.Settle
-	previousVersion := int64(0)
-	if state := adapter.State(); state.Sellers[firstSeller] != nil && state.Sellers[firstSeller].Quote != nil {
-		previousVersion = state.Sellers[firstSeller].Quote.Version
+	state := adapter.State()
+	seatCount = max(1, state.Config.SeatsPerSeller)
+	for sellerID, seller := range state.Sellers {
+		if seller.Quote != nil {
+			versions[sellerID] = seller.Quote.Version
+		}
 	}
-	restored := adapter.State().Revision > 0
+	restored := state.Revision > 0
 	loop.Start(ctx)
 	defer func() {
 		closeSessions()
@@ -667,11 +759,23 @@ func Run(ctx context.Context, options Options) (*bitfs.PurchaseResult, error) {
 			return nil, err
 		}
 	}
-	versionsMu.Lock()
-	versions[firstSeller] = previousVersion
-	versionsMu.Unlock()
+	for sellerID := range state.Sellers {
+		if err := reportSeats(sellerID, "seller-restore-"+runID+"-"+sellerID); err != nil {
+			return nil, err
+		}
+	}
 	if err := feedQuote(firstSeller, firstSession, firstTerms); err != nil {
 		return nil, err
+	}
+	if options.PlaybackReady != nil {
+		record, err := quotes.Quote(ctx, firstSeller, firstSession)
+		if err != nil {
+			return nil, err
+		}
+		read := livePlaybackReader(options.Store, options.SeedHash, execID, state, loop, firstTerms, record.QuoteRaw, logf)
+		if stop := options.PlaybackReady(read); stop != nil {
+			defer stop()
+		}
 	}
 	intent := "start"
 	if restored {
@@ -681,6 +785,15 @@ func Run(ctx context.Context, options Options) (*bitfs.PurchaseResult, error) {
 		return nil, err
 	}
 	go intake()
+	if options.RequestQuotes != nil && seatCount > 1 {
+		go func() {
+			for i := int64(1); i < seatCount && ctx.Err() == nil; i++ {
+				if err := options.RequestQuotes(ctx); err != nil && ctx.Err() == nil {
+					logf("发布额外席位需求失败: %v", err)
+				}
+			}
+		}()
+	}
 	stopControls := func() {}
 	if options.Ready != nil {
 		stopControls = options.Ready(func(event scheduler.Event) error { return loop.Feed(ctx, event) })

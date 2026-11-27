@@ -48,8 +48,8 @@ importers:
         specifier: 5.1.6
         version: 5.1.6
       keymaster-trade-scheduler:
-        specifier: 0.3.0
-        version: 0.3.0
+        specifier: 0.4.0
+        version: 0.4.0
       keymaster-utxo-manager:
         specifier: 0.7.0
         version: 0.7.0
@@ -454,8 +454,8 @@ packages:
     resolution: {integrity: sha512-/74xS1It1qMd2M6atx9gwCefhjHhXWjHUgV4MX018JuKEe6LcwNj6ryHxXeozqf3PpnK7CzXMyh1Whbm9kGVVQ==}
     engines: {node: '>=18.0.0'}
 
-  keymaster-trade-scheduler@0.3.0:
-    resolution: {integrity: sha512-HEM7Zp+CXov1FjhGtO5CzUgwrvmHHDic1X/nhfkquJ/tx9HdSjgZG12ZUJAEwuhH7xTzBHx49FhSy0/yo8hpnQ==}
+  keymaster-trade-scheduler@0.4.0:
+    resolution: {integrity: sha512-w3KXzKmCVN9p6DJ2ynv7Til6c4gcu5IAO4PedRZoEQLfRtOztJe1Rp/C19JlPJxq941wsqWze7gxYVoiub60oQ==}
 
   keymaster-utxo-manager@0.7.0:
     resolution: {integrity: sha512-/AhOUaiwybJ33Ao+TFvgJtaiCIU08jO9lfNNyRV3dGCIlprQ6Qe91mKlBVXQFGZwW7MIBXPk6VoCnCCL1E9Ohg==}
@@ -1329,7 +1329,7 @@ snapshots:
     dependencies:
       '@bsv/sdk': 2.1.7
 
-  keymaster-trade-scheduler@0.3.0: {}
+  keymaster-trade-scheduler@0.4.0: {}
 
   keymaster-utxo-manager@0.7.0: {}
 

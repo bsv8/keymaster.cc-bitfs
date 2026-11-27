@@ -96,6 +96,11 @@ func Delete(ctx context.Context, options DeleteOptions) error {
 			}
 		}
 	}
+	for _, id := range execs {
+		if err := options.Store.Remove(playbackQuotePath(options.SeedHash, id)); err != nil {
+			return err
+		}
+	}
 	if err := host.RetireExecutions(options.Store, options.SeedHash); err != nil {
 		return err
 	}

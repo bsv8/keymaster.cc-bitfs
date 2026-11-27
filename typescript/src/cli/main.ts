@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import type { Libp2p, Stream } from "@libp2p/interface";
 import { multiaddr } from "@multiformats/multiaddr";
+import { setStreamFrameMeter } from "bitcoin-libp2p/stream";
 import { newMessageID, parseSHA256Hash, publicKeyFromPrivate } from "bsv8-channel-protocol";
 import { HASH_REQUEST_CHANNEL, marshal, newMultiaddrLocator, parseAndVerify, sign } from "bsv8-channel-protocol/hash-request";
 import {
@@ -25,6 +26,7 @@ interface Config {
   Arbiters: Array<{ publicKeyHex: string; address: string }>;
   FeeRate: number;
   MaxBlockPrice: string;
+  SeatsPerSeller?: number;
   TradeDir: string;
   OutputDir?: string;
   SellerDir?: string;
@@ -62,7 +64,7 @@ async function get(config: Config, key: Uint8Array, wallet: Wallet, host: Libp2p
   const buyer = createBitfsBuyer({
     identity: () => ({ owner: wallet.owner, network: config.Network, generation: 1 }),
     settings: async () => ({ ...SCHEDULER_HOST_DEFAULTS, maxFullBlockPriceSatoshis: config.MaxBlockPrice,
-      buyerAutoPurchaseEnabled: true, maxConcurrentDownloads: 1, refundDelayBlocks: 5 }),
+      buyerAutoPurchaseEnabled: true, maxConcurrentDownloads: 1, refundDelayBlocks: 5, schedulerSeatsPerSeller: config.SeatsPerSeller }),
     signer: wallet.signer, content, journal, lifecycle: lifecycle.signal, tryLock: lock,
     publishDemand: async (seedHashHex, signal, prepared) => {
       const address = host.getMultiaddrs()[0];
@@ -74,7 +76,7 @@ async function get(config: Config, key: Uint8Array, wallet: Wallet, host: Libp2p
       const signed = sign({ from_public_key, message_id, issued_at_ms, expires_at_ms,
         body: { hash: parseSHA256Hash(seedHashHex), locators: [newMultiaddrLocator(address.toString())] },
       }, key);
-      demandId = message_id;
+      demandId ??= message_id;
       prepared(message_id);
       await gateway.publish(HASH_REQUEST_CHANNEL, marshal(signed), signal);
       return { requestMessageId: message_id, expiresAtMs: expires_at_ms };
@@ -113,6 +115,13 @@ async function get(config: Config, key: Uint8Array, wallet: Wallet, host: Libp2p
       await stream.close();
       return;
     }
+    let bytesIn = 0;
+    setStreamFrameMeter(stream, {
+      bytesIn(bytes) {
+        bytesIn += bytes;
+        void buyer.onTransportEvent({ type: "progress", sessionId, bytesIn }).catch(traceError);
+      },
+    });
     try {
       const signalForRead = AbortSignal.any([lifecycle.signal, signal]);
       for await (const artifact of readArtifacts(stream, { signal: signalForRead })) {

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"strconv"
 	"sync"
 
 	masterseed "github.com/bsv8/MasterSeed"
@@ -27,23 +26,20 @@ type localFileInfo struct {
 // 一个实例；配置变化时新建，不影响已创建任务（配置已复制进快照）。
 var sharedSchedulers = struct {
 	sync.Mutex
-	instances map[string]*scheduler.Scheduler
-}{instances: make(map[string]*scheduler.Scheduler)}
+	instances map[scheduler.Config]*scheduler.Scheduler
+}{instances: make(map[scheduler.Config]*scheduler.Scheduler)}
 
 func sharedScheduler(limits scheduler.Config) (*scheduler.Scheduler, error) {
-	key := limits.MaxBlockPrice + "/" + strconv.FormatInt(limits.BaseSeats, 10) + "/" +
-		strconv.FormatInt(limits.FloatingSeats, 10) + "/" + strconv.FormatInt(limits.PoolBlocks, 10) +
-		"/" + strconv.FormatInt(limits.RequestTimeoutMs, 10)
 	sharedSchedulers.Lock()
 	defer sharedSchedulers.Unlock()
-	if sched, ok := sharedSchedulers.instances[key]; ok {
+	if sched, ok := sharedSchedulers.instances[limits]; ok {
 		return sched, nil
 	}
 	sched, err := scheduler.New(limits)
 	if err != nil {
 		return nil, err
 	}
-	sharedSchedulers.instances[key] = sched
+	sharedSchedulers.instances[limits] = sched
 	return sched, nil
 }
 

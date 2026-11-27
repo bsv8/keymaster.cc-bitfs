@@ -49,19 +49,20 @@ import (
 )
 
 type config struct {
-	Network       string
-	IdentityFile  string
-	ChainURL      string
-	Supplier      string
-	Listen        string
-	Arbiters      []arbitration.Endpoint
-	FeeRate       int64
-	MaxBlockPrice string
-	TradeDir      string
-	OutputDir     string
-	SellerDir     string
-	SeedPrice     string
-	BlockPrice    string
+	Network        string
+	IdentityFile   string
+	ChainURL       string
+	Supplier       string
+	Listen         string
+	Arbiters       []arbitration.Endpoint
+	FeeRate        int64
+	MaxBlockPrice  string
+	SeatsPerSeller int64
+	TradeDir       string
+	OutputDir      string
+	SellerDir      string
+	SeedPrice      string
+	BlockPrice     string
 }
 
 type runtime struct {
@@ -105,7 +106,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg := config{Network: "test", Listen: "/ip4/127.0.0.1/tcp/0", FeeRate: 100, SeedPrice: "1", BlockPrice: "1"}
+	cfg := config{Network: "test", Listen: "/ip4/127.0.0.1/tcp/0", FeeRate: 100, SeatsPerSeller: 1, SeedPrice: "1", BlockPrice: "1"}
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return err
 	}
@@ -322,7 +323,7 @@ func (r *runtime) get(ctx context.Context, stop <-chan struct{}, seed string, re
 			_, err := publisher.PublishDemand(ctx, seed, discovery.MaxDemandLifetime)
 			return err
 		},
-		Config: scheduler.Config{MaxBlockPrice: r.MaxBlockPrice},
+		Config: scheduler.Config{MaxBlockPrice: r.MaxBlockPrice, SeatsPerSeller: r.SeatsPerSeller},
 		OnView: func(view scheduler.View) {
 			if err := json.NewEncoder(os.Stdout).Encode(map[string]any{
 				"state": view.Execution, "funds": view.Funds, "completed": view.Completed, "total": view.Total,

@@ -1,7 +1,7 @@
 {
   "name": "keymaster-bitfs",
   "packageManager": "pnpm@11.5.1",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "exports": {
     ".": {
@@ -30,7 +30,7 @@
     "bitfs-protocol": "0.6.0",
     "bsv8-channel-protocol": "0.6.0",
     "cborg": "5.1.6",
-    "keymaster-trade-scheduler": "0.3.0",
+    "keymaster-trade-scheduler": "0.4.0",
     "keymaster-utxo-manager": "0.7.0",
     "libp2p": "3.5.1",
     "masterseed": "1.1.0",

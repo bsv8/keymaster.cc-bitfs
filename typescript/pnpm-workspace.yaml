@@ -1,0 +1,3 @@
+# pnpm 默认的 24 小时发布年龄策略会阻断刚发布的 scheduler 依赖。
+minimumReleaseAgeExclude:
+  - keymaster-trade-scheduler@0.4.0

@@ -4,6 +4,8 @@ TypeScript and Go libraries for BitFS buyers and sellers. Hosts supply authentic
 
 - TypeScript exports `createBitfsBuyer`, `createBitfsSeller` and the seller protocol ports from `keymaster-bitfs`.
 - Go hosts call `download.Run`, `download.Delete` and `seller.NewRuntime` in `github.com/bsv8/keymaster.cc-bitfs`.
+- Buyer hosts can set the number of seats per seller with `schedulerSeatsPerSeller` in TypeScript or `download.Options.Config.SeatsPerSeller` in Go. The default is one seat.
+- Playback hosts can read verified ranges and request missing blocks first through `readPlaybackRange` in TypeScript and the reader supplied by `download.Options.PlaybackReady` in Go. Go hosts can read a durable execution with `download.ReadPlaybackRange`.
 - A successful output hook publishes the verified content to the host. The download workspace can then be deleted independently of the published file.
 
 ## Standalone commands
@@ -21,6 +23,6 @@ Both executables accept the same commands. A stopped buyer keeps its workspace, 
 
 Use `SIGINT` or `SIGTERM` for a normal stop. Use the same identity and trade directory to resume a stopped or interrupted download. The seller indexes the configured directory on start.
 
-Configuration is a JSON object with `Network`, `IdentityFile`, `ChainURL`, `Supplier`, `Listen`, `Arbiters`, `FeeRate`, `TradeDir`, `OutputDir`, `SellerDir`, `MaxBlockPrice`, `SeedPrice` and `BlockPrice`. `IdentityFile` names a private local file containing a 32-byte hex key. `Supplier` is the authenticated SSP gateway multiaddr. Each item in `Arbiters` has `publicKeyHex` and `address`. Price fields are decimal satoshi strings, and `FeeRate` is in satoshis per kilobyte.
+Configuration is a JSON object with `Network`, `IdentityFile`, `ChainURL`, `Supplier`, `Listen`, `Arbiters`, `FeeRate`, `TradeDir`, `OutputDir`, `SellerDir`, `MaxBlockPrice`, `SeedPrice`, `BlockPrice` and optional `SeatsPerSeller`. `IdentityFile` names a private local file containing a 32-byte hex key. `Supplier` is the authenticated SSP gateway multiaddr. Each item in `Arbiters` has `publicKeyHex` and `address`. Price fields are decimal satoshi strings, and `FeeRate` is in satoshis per kilobyte.
 
 For TypeScript installs that resolve fresh dependencies, keep `keymaster-multisig-pool@4.0.0` on `@bsv/sdk@2.1.7`, as in the CLI lockfile. This is the BSV SDK pairing used for the BitFS protocol flow. Browser bundles need the host's `crypto.createHmac` adapter for this transitive dependency. cc already supplies it.

@@ -108,7 +108,7 @@ require (
 	github.com/bsv8/MultisigPool/v4 v4.0.0
 	github.com/bsv8/SatSubscriptionProtocol v0.3.0
 	github.com/bsv8/bitcoin-libp2p v0.3.2
-	github.com/bsv8/keymaster.cc-download-scheduler v0.3.0
+	github.com/bsv8/keymaster.cc-download-scheduler v0.4.0
 	github.com/bsv8/keymaster.cc-utxo-manager v0.7.0
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/libp2p/go-libp2p v0.50.0
